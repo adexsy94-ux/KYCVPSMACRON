@@ -1,0 +1,5 @@
+streamlit>=1.49,<2
+pandas>=2.2,<3
+numpy>=1.26,<3
+xlsxwriter>=3.2
+xlrd>=2.0.1
