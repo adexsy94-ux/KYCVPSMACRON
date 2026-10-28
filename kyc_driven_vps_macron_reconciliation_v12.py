@@ -5,13 +5,13 @@
 # Required business sequence:
 #   0. Clean/read all five sources with source-specific date handling (XLSX without openpyxl).
 #   1. Build supporting Paymeter <-> Macron history by exact reference.
-#   2. Match VPS <-> Bank credits; retain unrelated dated Bank credits/debits.
-#   3. Build the master identity table from the uploaded KYC file.
-#   4. Attach KYC to Paymeter-Macron and VPS-Bank histories.
+#   2. Match VPS <-> Bank credits as a SEPARATE bank control; retain genuine bank outflows.
+#   3. Build/update KYC from uploaded KYC + VPS + Paymeter + Macron ONLY (never Bank).
+#   4. Attach the completed KYC to supporting histories.
 #   5. Bridge VPS <-> Paymeter by account, gross value and time.
 #   6. Reconcile VPS directly against Macron using reference, KYC, value and time.
 #   7. Compare Expected Macron Token = VPS transaction_amount_minor - N100.
-#   8. Build Customer Summary, hard source tie-outs, management reports and Cash Posting.
+#   8. Build Customer Summary/source controls plus VPS<->Macron-only Option 2 and Cash Posting.
 # ================================================================
 
 import csv
@@ -739,20 +739,25 @@ def merge_vps_bank(vps, bank, date_tolerance=DATE_TOLERANCE_DAYS):
 # 3. BUILD MASTER KYC FROM THE UPLOADED KYC FILE
 # ================================================================
 
-def build_kyc(kyc_raw, pay, mac, vps_bank_merge):
-    """Build one customer identity row per Paymeter/VPS virtual account.
+def build_kyc(kyc_raw, pay, mac, vps):
+    """Build/update the master KYC without using the Bank statement.
 
-    Uploaded KYC is authoritative. Paymeter/VPS/Macron observations enrich the
-    master and are used to expose conflicts, never to silently overwrite KYC.
+    Identity chain:
+      VPS virtual_acct_no = Paymeter Account Number
+      Paymeter Disco Account Number = Macron ACCOUNT NUMBER
+
+    Uploaded KYC remains the first authority.  Where its Macron account is blank,
+    a single unambiguous Paymeter Disco Account Number can update the working KYC.
+    Conflicting mappings are exposed and are never silently overwritten.
     """
     raw = kyc_raw.copy()
     pay = pay.copy()
     mac = mac.copy()
-    vps_rows = vps_bank_merge[vps_bank_merge["VPS_virtual_acct_no"].map(clean_id).ne("")].copy()
+    vps = vps.copy()
 
     kyc_groups = {k: g.copy() for k, g in raw.groupby(raw["PAYMETER - Account Number"].map(clean_id), sort=False) if k}
     pay_groups = {k: g.copy() for k, g in pay.groupby(pay["Account Number"].map(clean_id), sort=False) if k}
-    vps_groups = {k: g.copy() for k, g in vps_rows.groupby(vps_rows["VPS_virtual_acct_no"].map(clean_id), sort=False) if k}
+    vps_groups = {k: g.copy() for k, g in vps.groupby(vps["virtual_acct_no"].map(clean_id), sort=False) if k}
     mac_groups = {k: g.copy() for k, g in mac.groupby(mac["ACCOUNT NUMBER"].map(clean_id), sort=False) if k}
 
     uploaded_mac_to_pay = defaultdict(set)
@@ -762,50 +767,74 @@ def build_kyc(kyc_raw, pay, mac, vps_bank_merge):
         if pa and ma:
             uploaded_mac_to_pay[ma].add(pa)
 
+    observed_disco_to_pay = defaultdict(set)
+    for _, rr in pay.iterrows():
+        pa = clean_id(rr.get("Account Number"))
+        ma = clean_id(rr.get("Disco Account Number"))
+        if pa and ma:
+            observed_disco_to_pay[ma].add(pa)
+
     all_accounts = sorted(set(kyc_groups) | set(pay_groups) | set(vps_groups))
     records = []
     for acct in all_accounts:
         kg = kyc_groups.get(acct, raw.iloc[0:0])
         pg = pay_groups.get(acct, pay.iloc[0:0])
-        vg = vps_groups.get(acct, vps_rows.iloc[0:0])
+        vg = vps_groups.get(acct, vps.iloc[0:0])
 
         kyc_names = unique_join(kg.get("PAYMETER - Customer Name", pd.Series(dtype=object)))
         kyc_meters = unique_join(kg.get("METER NUMBER", pd.Series(dtype=object)))
-        kyc_mac = unique_join(kg.get("MACRON ACCOUNT NUMBER", pd.Series(dtype=object)))
-        kyc_mac_list = split_multi(kyc_mac)
+        uploaded_mac = unique_join(kg.get("MACRON ACCOUNT NUMBER", pd.Series(dtype=object)))
+        uploaded_mac_list = split_multi(uploaded_mac)
 
         observed_disco = unique_join(pg.get("Disco Account Number", pd.Series(dtype=object)))
+        observed_disco_list = split_multi(observed_disco)
         observed_meters = unique_join(pg.get("Meter Number", pd.Series(dtype=object)))
         observed_names = unique_join(pg.get("Customer Name", pd.Series(dtype=object)))
         phones = unique_join(pg.get("Phone Number", pd.Series(dtype=object)))
 
-        mac_meter_values = []
-        mac_tx_count = 0
-        for ma in kyc_mac_list:
-            mg = mac_groups.get(ma)
-            if mg is not None:
-                mac_tx_count += len(mg)
-                mac_meter_values.extend(mg.get("METER NUMBER", pd.Series(dtype=object)).tolist())
-        mac_meters = unique_join(mac_meter_values)
-
         conflicts = []
-        if len(kyc_mac_list) > 1:
+        if len(uploaded_mac_list) > 1:
             conflicts.append("Multiple Macron accounts in uploaded KYC for one Paymeter account")
-        for ma in kyc_mac_list:
+        for ma in uploaded_mac_list:
             if len(uploaded_mac_to_pay.get(ma, set())) > 1:
                 conflicts.append("Macron account is assigned to multiple Paymeter accounts in uploaded KYC")
                 break
-        observed_disco_list = split_multi(observed_disco)
         if len(observed_disco_list) > 1:
-            conflicts.append("Multiple Paymeter Disco Account Numbers observed")
-        if len(kyc_mac_list) == 1 and observed_disco_list and any(x != kyc_mac_list[0] for x in observed_disco_list):
+            conflicts.append("Multiple Paymeter Disco Account Numbers observed for one Paymeter account")
+        for ma in observed_disco_list:
+            if len(observed_disco_to_pay.get(ma, set())) > 1:
+                conflicts.append("Paymeter Disco/Macron account is observed against multiple Paymeter accounts")
+                break
+        if len(uploaded_mac_list) == 1 and observed_disco_list and any(x != uploaded_mac_list[0] for x in observed_disco_list):
             conflicts.append("Uploaded KYC Macron account disagrees with Paymeter Disco Account Number")
+
+        # Effective Macron account: uploaded KYC first; if blank, enrich from a
+        # single Paymeter Disco Account Number.  Never overwrite a conflict.
+        effective_mac = ""
+        mapping_source = ""
+        if not conflicts and len(uploaded_mac_list) == 1:
+            effective_mac = uploaded_mac_list[0]
+            mapping_source = "Uploaded KYC MACRON ACCOUNT NUMBER"
+        elif not conflicts and not uploaded_mac_list and len(observed_disco_list) == 1:
+            effective_mac = observed_disco_list[0]
+            mapping_source = "Updated from Paymeter Disco Account Number"
+
+        mac_meter_values = []
+        mac_tx_count = 0
+        if effective_mac:
+            mg = mac_groups.get(effective_mac)
+            if mg is not None:
+                mac_tx_count = len(mg)
+                mac_meter_values.extend(mg.get("METER NUMBER", pd.Series(dtype=object)).tolist())
+        mac_meters = unique_join(mac_meter_values)
 
         in_uploaded_kyc = len(kg) > 0
         if conflicts:
             status = "KYC CONFLICT"
-        elif in_uploaded_kyc and len(kyc_mac_list) == 1:
+        elif effective_mac and uploaded_mac_list:
             status = "MASTER MAPPED"
+        elif effective_mac and not uploaded_mac_list:
+            status = "UPDATED FROM PAYMETER DISCO"
         elif in_uploaded_kyc:
             status = "INCOMPLETE KYC"
         else:
@@ -815,30 +844,33 @@ def build_kyc(kyc_raw, pay, mac, vps_bank_merge):
         if not customer_name:
             customer_name = most_common_text(pg.get("Customer Name", pd.Series(dtype=object)))
         if not customer_name:
-            customer_name = most_common_text(vg.get("VPS_source_acct_name", pd.Series(dtype=object)))
+            customer_name = most_common_text(vg.get("source_acct_name", pd.Series(dtype=object)))
 
         records.append({
             "KYC_ID": acct,
             "Customer Name": customer_name,
             "VPS Virtual Account Number": acct,
-            "VPS Source Account Name(s)": unique_join(vg.get("VPS_source_acct_name", pd.Series(dtype=object))),
-            "VPS Source Account Number(s)": unique_join(vg.get("VPS_source_acct_no", pd.Series(dtype=object))),
+            "VPS Source Account Name(s)": unique_join(vg.get("source_acct_name", pd.Series(dtype=object))),
+            "VPS Source Account Number(s)": unique_join(vg.get("source_acct_no", pd.Series(dtype=object))),
             "Paymeter Account Number(s)": acct,
             "Paymeter Customer Name(s)": observed_names or kyc_names,
             "Customer Phone Number(s)": phones,
             "KYC Meter Number(s)": kyc_meters,
             "Paymeter Meter Number(s)": observed_meters,
             "Paymeter Disco Account Number(s)": observed_disco,
-            "Macron Account Number(s)": kyc_mac,
+            "Uploaded KYC Macron Account Number(s)": uploaded_mac,
+            "Macron Account Number(s)": effective_mac,
+            "Macron Account Mapping Source": mapping_source,
             "Macron Meter Number(s)": mac_meters,
             "Uploaded KYC Row Count": len(kg),
             "VPS Transaction Count": len(vg),
             "Paymeter Transaction Count": len(pg),
             "Macron Transaction Count": mac_tx_count,
-            "KYC Link Method": "Uploaded KYC master: Paymeter Account Number -> Macron Account Number" if in_uploaded_kyc else "Observed transaction data only",
-            "KYC Conflict": "; ".join(conflicts),
+            "KYC Link Method": "VPS virtual_acct_no = Paymeter Account Number; Paymeter Disco Account Number = Macron ACCOUNT NUMBER",
+            "KYC Sources Used": "Uploaded KYC | VPS | Paymeter | Macron (Bank excluded)",
+            "KYC Conflict": "; ".join(dict.fromkeys(conflicts)),
             "KYC Status": status,
-            "KYC Match Usable?": "YES" if status == "MASTER MAPPED" else "NO",
+            "KYC Match Usable?": "YES" if status in {"MASTER MAPPED", "UPDATED FROM PAYMETER DISCO"} else "NO",
         })
     return pd.DataFrame(records)
 
@@ -1351,12 +1383,10 @@ def _final_recon_row(l, r, match_meta):
         status = kyc_status
     elif has_vps and has_mac and amount_status == "AMOUNT DIFFERENCE":
         status = "VPS / MACRON VALUE DIFFERENCE"
-    elif has_vps and has_mac and not has_bank:
-        status = "VPS / MACRON MATCH - BANK MISSING"
     elif has_vps and has_mac and amount_status == "AMOUNTS ALIGNED":
-        status = "FULLY RECONCILED"
-    elif has_vps and not has_bank:
-        status = "VPS PRESENT - BANK MISSING"
+        # Primary reconciliation is VPS <-> Macron. Bank is a separate
+        # supporting control and does not determine whether the token flow reconciles.
+        status = "VPS / MACRON RECONCILED"
     elif has_pm and not has_vps and not has_mac:
         status = "PAYMETER ONLY - NO VPS / MACRON"
     elif has_bank and not has_vps:
@@ -1443,84 +1473,61 @@ def build_vps_macron_comparison(final_recon):
 
 
 def build_posting_ledger(final_recon):
-    """Seven-column posting view requested by the user.
+    """Seven-column VPS <-> Macron posting view.
 
-    Reconciled customer flow keeps the original accounting meanings:
-      Cash In  = VPS gross less the fixed NGN 100 customer charge.
-      Cash Out = actual Macron amount issued.
-      Interest = NGN 100 less actual bank charge (VPS gross - VPS settled).
+    The Bank statement is deliberately EXCLUDED from this sheet.
 
-    Genuine Bank-only movements are also retained. For those rows, Cash In/Out
-    is the actual bank Credit/Debit and customer/account fields remain blank.
+    Business meaning:
+      Cash In  = VPS transaction_amount_minor - N100
+                 (customer value available for token).
+      Cash Out = actual Macron AMOUNT issued.
+      Interest = VPS settled_amount_minor - Cash In.
+                 This is the part of the N100 fee retained after the charge
+                 already reflected between VPS gross and VPS settled.
+
+    Example: customer pays N9,000, expected token/Cash In = N8,900.
+    If VPS settled = N8,950, Interest = N50.
     """
     rows = []
     for _, r in final_recon.iterrows():
         vps_present = clean_id(r.get("VPS Present?")) == "YES"
         mac_present = clean_id(r.get("Macron Present?")) == "YES"
-        bank_present = clean_id(r.get("Bank Present?")) == "YES"
-        pm_present = clean_id(r.get("Paymeter Present?")) == "YES"
+
+        # Sheet 17 is strictly VPS/Macron. Ignore Bank-only and Paymeter-only rows.
+        if not (vps_present or mac_present):
+            continue
 
         trx_date = pd.NaT
-        # Posting date follows the actual transaction side: VPS first for
-        # customer receipts, then Macron/Paymeter, and Bank for bank-only rows.
-        for key in ["LEFT_VPS_VPS_DateTime", "RIGHT_MAC_MAC_DateTime", "RIGHT_PM_PM_DateTime", "LEFT_BANK_BANK_DateTime"]:
+        # Use only the primary ledgers' dates: VPS first, Macron fallback.
+        for key in ["LEFT_VPS_VPS_DateTime", "RIGHT_MAC_MAC_DateTime"]:
             value = r.get(key)
             if pd.notna(value):
                 trx_date = pd.Timestamp(value).normalize()
                 break
 
-        bank_only = bank_present and not vps_present and not mac_present and not pm_present
-        if bank_only:
-            bank_credit = pd.to_numeric(pd.Series([r.get("LEFT_BANK_Credit")]), errors="coerce").iloc[0]
-            bank_debit = pd.to_numeric(pd.Series([r.get("LEFT_BANK_Debit")]), errors="coerce").iloc[0]
-            rows.append({
-                "Transaction Date": trx_date,
-                "Customer Name": "",
-                "Account Number": "",
-                "Cash In": float(bank_credit) if pd.notna(bank_credit) else 0.0,
-                "Cash Out": float(bank_debit) if pd.notna(bank_debit) else 0.0,
-                "Interest": 0.0,
-                "Source": "Bank",
-            })
-            continue
+        gross = pd.to_numeric(pd.Series([r.get("VPS Customer Amount Paid")]), errors="coerce").iloc[0]
+        settled = pd.to_numeric(pd.Series([r.get("VPS Settled Amount")]), errors="coerce").iloc[0]
+        mac_amount = pd.to_numeric(pd.Series([r.get("Macron Token Amount")]), errors="coerce").iloc[0]
 
-        gross = r.get("VPS Customer Amount Paid")
-        settled = r.get("VPS Settled Amount")
         cash_in = float(gross) - MACRON_TOKEN_CHARGE if vps_present and pd.notna(gross) else 0.0
-        cash_out = float(r.get("Macron Token Amount")) if mac_present and pd.notna(r.get("Macron Token Amount")) else 0.0
-        if vps_present and pd.notna(gross) and pd.notna(settled):
-            actual_bank_charge = float(gross) - float(settled)
-            interest = MACRON_TOKEN_CHARGE - actual_bank_charge
-        else:
-            interest = 0.0
+        cash_out = float(mac_amount) if mac_present and pd.notna(mac_amount) else 0.0
+        # Algebraically equal to N100 - (VPS gross - VPS settled), but this
+        # formulation makes the user's rule explicit: amount above expected token
+        # that remains after VPS settlement is interest.
+        interest = float(settled) - cash_in if vps_present and pd.notna(settled) else 0.0
 
-        if bank_present and vps_present and mac_present:
-            source = "Bank/VPS/Macron"
-        elif bank_present and vps_present:
-            source = "Bank/VPS"
-        elif vps_present and mac_present:
-            source = "VPS/Macron"
-        elif mac_present:
-            source = "Macron"
-        elif vps_present:
-            source = "VPS"
-        elif pm_present:
-            source = "Paymeter"
-        elif bank_present:
-            source = "Bank"
-        else:
-            source = ""
+        source = "VPS/Macron" if vps_present and mac_present else "VPS" if vps_present else "Macron"
 
         rows.append({
             "Transaction Date": trx_date,
             "Customer Name": clean_id(r.get("FINAL_Customer_Name")),
-            "Account Number": clean_id(r.get("FINAL_KYC_ID")) or clean_id(r.get("LEFT_VPS_virtual_acct_no")) or clean_id(r.get("RIGHT_PM_Account Number")),
+            "Account Number": clean_id(r.get("FINAL_KYC_ID")) or clean_id(r.get("LEFT_VPS_virtual_acct_no")),
             "Cash In": cash_in,
             "Cash Out": cash_out,
             "Interest": interest,
             "Source": source,
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=["Transaction Date", "Customer Name", "Account Number", "Cash In", "Cash Out", "Interest", "Source"])
 
 
 # ================================================================
@@ -1683,7 +1690,10 @@ def _option2_exposure_category(share):
 
 def build_option2_management(customer_summary):
     """
-    Build the Option 2 management report directly from Customer Summary.
+    Build the Option 2 management report from VPS and Macron ONLY.
+
+    Bank statement values are deliberately excluded from all Option 2
+    calculations, rankings and exposure measures.
 
     Business logic:
       Expected Token = Total VPS Customer Amount Paid
@@ -1705,6 +1715,7 @@ def build_option2_management(customer_summary):
         "Customer Name",
         "Total VPS Payment Count",
         "Total VPS Customer Amount Paid",
+        "Total Macron Vend Count",
         "Total Macron Token Amount",
         "VPS Paid / No Token Count",
         "Token / No VPS Payment Count",
@@ -1717,12 +1728,17 @@ def build_option2_management(customer_summary):
     numeric_cols = [
         "Total VPS Payment Count",
         "Total VPS Customer Amount Paid",
+        "Total Macron Vend Count",
         "Total Macron Token Amount",
         "VPS Paid / No Token Count",
         "Token / No VPS Payment Count",
     ]
     for c in numeric_cols:
         work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
+
+    # Option 2 is strictly VPS <-> Macron. Remove Bank-only / Paymeter-only
+    # identities before any financial calculation.
+    work = work[(work["Total VPS Payment Count"] > 0) | (work["Total Macron Vend Count"] > 0)].copy()
 
     # Recalculate expected token from the clarified business rule.
     work["Option2 Expected Token Value"] = (
@@ -1913,6 +1929,7 @@ def _write_option2_management_sheet(writer, option2_detail):
     ws.set_row(0, 28)
     ws.merge_range(
         "A2:P2",
+        "VPS ↔ Macron analysis only — Bank statement is excluded. "
         "Exposure category = each customer's individual share of the relevant total outstanding. "
         "Purchase frequency is shown separately and does not change financial materiality.",
         fmt_subtitle,
@@ -2161,7 +2178,7 @@ def build_column_guide(sheet_pairs):
         "01 Cleaned Paymeter": "Paymeter after CSV repair/normalisation. RRN and meter scientific-notation loss is explicitly flagged.",
         "02 PM Macron Merge": "Supporting transaction history: Paymeter Reference = Macron REFERENCE ID.",
         "03 VPS Bank Merge": "VPS reconciled to Bank credits; all other genuine dated Bank credits/debits remain as Bank-only movements.",
-        "04 KYC": "Master customer identity built from the uploaded KYC mapping; conflicts are never silently resolved.",
+        "04 KYC": "Master identity built/updated from Uploaded KYC + VPS + Paymeter + Macron only. Bank statement is excluded from KYC.",
         "05 PM Macron + KYC": "Paymeter-Macron supporting history with uploaded KYC attached.",
         "06 VPS Bank + KYC": "VPS-Bank history with uploaded KYC attached.",
         "07 Full Reconciliation": "Main reconciliation. VPS is the control ledger and Macron is the token ledger; Paymeter/KYC provide identity and reference evidence.",
@@ -2173,8 +2190,8 @@ def build_column_guide(sheet_pairs):
         "13 Token No VPS": "Macron token rows with no paired VPS payment.",
         "14 Missing KYC": "Full-reconciliation rows without an uploaded-KYC identity.",
         "15 Source Coverage": "Checks that every genuine Bank transaction, VPS, Paymeter and Macron source row is represented exactly once.",
-        "16 Option 2 Management": "Management exposure report retained from the original application.",
-        "17 Cash Posting": "Seven-column posting view. Unrelated Bank credits/debits remain with blank customer/account and actual Bank Cash In/Cash Out.",
+        "16 Option 2 Management": "Management exposure using VPS expected token versus actual Macron token only; Bank statement is excluded.",
+        "17 Cash Posting": "Seven-column VPS/Macron-only posting view. Bank statement and Paymeter amounts are excluded from the financial analysis.",
         "18 Uploaded KYC": "Raw uploaded KYC file retained for traceability.",
         "19 VPS Paymeter Bridge": "Transaction-level VPS-to-Paymeter bridge using account, exact gross amount and nearest time.",
         "20 KYC Conflicts": "Uploaded KYC or observed Paymeter account mapping conflicts requiring review.",
@@ -2195,19 +2212,19 @@ def build_column_guide(sheet_pairs):
             elif col == "VPSBANK_Match_Status":
                 calc = "MATCHED when VPS session_id is found in Bank Narration or unique settled amount/date fallback succeeds."
             elif col == "KYC_ID":
-                calc = "Uploaded KYC PAYMETER - Account Number, which is also the VPS virtual account identity."
+                calc = "Paymeter/VPS account identity built from Uploaded KYC, raw VPS, Paymeter and Macron; Bank statement is excluded."
             elif col == "FINAL_Match_Method":
                 calc = "Tier 1: VPS->Paymeter transaction + exact Paymeter/Macron reference. Tier 2: KYC Macron account + expected value + time. Tier 3: same KYC Macron account + nearest time, REVIEW only."
             elif col == "FINAL_Reconciliation_Status":
-                calc = "Derived primarily from VPS/Macron presence, KYC identity, expected-token difference and Bank control."
+                calc = "Derived from VPS/Macron presence, KYC identity and expected-token difference. Bank is a separate supporting control only."
             elif col == "Cash In":
                 calc = "VPS gross - N100 fixed charge, matching the requested posting logic."
             elif col == "Cash Out":
                 calc = "Actual Macron token amount."
             elif col == "Interest":
-                calc = "N100 - actual bank charge; actual bank charge = VPS gross - VPS settled."
+                calc = "VPS settled_amount_minor - (VPS transaction_amount_minor - N100). Bank statement is not used."
             elif col == "Source":
-                calc = "Bank/Macron when both are present; otherwise the available source side."
+                calc = "VPS/Macron, VPS, or Macron only. Bank statement is excluded from Sheet 17."
             elif col == "Option2 Expected Token Value":
                 calc = "Total VPS Customer Amount Paid - (Total VPS Payment Count x N100)."
                 meaning = "Correct token value due to the customer after the N100 charge on each VPS payment."
@@ -2332,8 +2349,8 @@ def run_reconciliation(bank_file, vps_file, paymeter_file, macron_file, kyc_file
     progress_call(progress, 25, "Reconciling VPS receipts to the Bank statement...")
     vps_bank = merge_vps_bank(vps, bank, date_tolerance)
 
-    progress_call(progress, 36, "Building uploaded-KYC master and checking mapping conflicts...")
-    kyc = build_kyc(kyc_uploaded, pay, mac, vps_bank)
+    progress_call(progress, 36, "Building KYC from uploaded KYC + VPS + Paymeter + Macron only (Bank excluded)...")
+    kyc = build_kyc(kyc_uploaded, pay, mac, vps)
     kyc_conflicts = kyc[kyc["KYC Status"].str.contains("CONFLICT", case=False, na=False)].copy()
 
     progress_call(progress, 46, "Attaching KYC to supporting Paymeter/Macron and VPS/Bank histories...")
@@ -2346,7 +2363,7 @@ def run_reconciliation(bank_file, vps_file, paymeter_file, macron_file, kyc_file
     progress_call(progress, 70, "Reconciling VPS directly against Macron using reference, KYC, value and time...")
     final_recon = reconcile_merged_reports(vps_bank_kyc, vps_pay_bridge, pay, mac, kyc, transaction_hours, HIGH_CONFIDENCE_MINUTES)
 
-    progress_call(progress, 81, "Building VPS-versus-Macron and seven-column Cash In/Cash Out views, including Bank-only movements...")
+    progress_call(progress, 81, "Building VPS-versus-Macron and VPS/Macron-only seven-column Cash Posting...")
     vps_macron = build_vps_macron_comparison(final_recon)
     cash_posting = build_posting_ledger(final_recon)
 
@@ -2361,7 +2378,7 @@ def run_reconciliation(bank_file, vps_file, paymeter_file, macron_file, kyc_file
     source_coverage = build_source_coverage(final_recon, bank, vps, pay, mac)
     management = build_management(final_recon, kyc, pay, summary_control)
 
-    progress_call(progress, 96, "Building retained Option 2 management exposure report...")
+    progress_call(progress, 96, "Building VPS/Macron-only Option 2 management exposure report (Bank excluded)...")
     option2_management = build_option2_management(customer_summary)
 
     progress_call(progress, 100, "Reconciliation calculations complete.")
@@ -2397,9 +2414,10 @@ def main():
         raise RuntimeError("Install Streamlit and the packages listed in requirements.txt")
     st.set_page_config(page_title="KYC-Driven VPS / Macron Reconciliation", page_icon="📊", layout="wide")
     st.title("📊 KYC-Driven VPS / Macron Reconciliation")
-    st.caption("Bank → VPS → Paymeter bridge/KYC identity → Macron. VPS and Macron are the primary reconciliation ledgers.")
+    st.caption("VPS ↔ Macron is the primary reconciliation. Paymeter/KYC provide identity/reference evidence; Bank is a separate supporting control only.")
     st.info(
-        "Uploaded KYC is the master identity table. Paymeter supplies the account bridge and transaction reference evidence. "
+        "Uploaded KYC is the starting identity table. It is updated from VPS/Paymeter/Macron only; Bank never updates KYC. "
+        "Paymeter supplies the account bridge and transaction reference evidence. "
         "Expected Macron token is VPS transaction_amount_minor less ₦100. Ambiguous matches are not forced."
     )
 
@@ -2427,7 +2445,7 @@ def main():
    - then KYC Macron account + expected value + time;
    - then same KYC Macron account + nearest time as REVIEW-only fallback.
 7. Preserve every unmatched Bank, VPS, Paymeter and Macron source row and hard-tie the customer summary back to source totals.
-8. Produce the retained management report plus the seven-column **Cash Posting** sheet.
+8. Produce **Option 2 Management** and **Cash Posting** strictly from VPS versus Macron. Bank stays outside both analyses.
 """)
         return
 
@@ -2497,7 +2515,7 @@ def main():
         st.download_button(
             "⬇️ DOWNLOAD RECONCILIATION WORKBOOK",
             data=excel,
-            file_name="KYC_Driven_VPS_Macron_Reconciliation_V11.xlsx",
+            file_name="KYC_Driven_VPS_Macron_Reconciliation_V14.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
