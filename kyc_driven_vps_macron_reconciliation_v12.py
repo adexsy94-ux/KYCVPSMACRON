@@ -16,6 +16,7 @@
 
 import csv
 import io
+import importlib.util
 import re
 from collections import defaultdict, deque
 from pathlib import Path
@@ -2242,6 +2243,17 @@ def main():
     if st is None:
         raise RuntimeError("Install Streamlit and the packages listed in requirements.txt")
     st.set_page_config(page_title="KYC-Driven VPS / Macron Reconciliation", page_icon="📊", layout="wide")
+    if importlib.util.find_spec("openpyxl") is None:
+        st.error(
+            "The Python package 'openpyxl' is not installed in this Streamlit environment. "
+            "Add the supplied requirements.txt file to the same folder as this app (or the repository root), "
+            "commit it to GitHub, and reboot/redeploy the app."
+        )
+        st.code(
+            "streamlit>=1.49,<2\npandas>=2.2,<3\nnumpy>=1.26,<3\nopenpyxl>=3.1.5,<4\nxlsxwriter>=3.2\nxlrd>=2.0.1",
+            language="text",
+        )
+        st.stop()
     st.title("📊 KYC-Driven VPS / Macron Reconciliation")
     st.caption("Bank → VPS → Paymeter bridge/KYC identity → Macron. VPS and Macron are the primary reconciliation ledgers.")
     st.info(
